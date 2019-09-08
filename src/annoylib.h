@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <stddef.h>
+
 #if defined(_MSC_VER) && _MSC_VER == 1500
 typedef unsigned char     uint8_t;
 typedef signed __int32    int32_t;
@@ -44,6 +45,7 @@ typedef unsigned __int64  uint64_t;
  #include <sys/mman.h>
 #endif
 
+#include <cerrno>
 #include <string.h>
 #include <math.h>
 #include <vector>
@@ -67,20 +69,20 @@ typedef unsigned __int64  uint64_t;
 
 #ifndef _MSC_VER
 #define popcount __builtin_popcountll
-#elif _MSC_VER == 1500
+#else // See #293, #358
 #define isnan(x) _isnan(x)
 #define popcount cole_popcount
-#else
-#define popcount __popcnt64
 #endif
 
 #ifndef NO_MANUAL_VECTORIZATION
-#if defined(__AVX__) && defined (__SSE__) && defined(__SSE2__) && defined(__SSE3__)
+#if defined(__AVX512F__)
+#define USE_AVX512
+#elif defined(__AVX__) && defined (__SSE__) && defined(__SSE2__) && defined(__SSE3__)
 #define USE_AVX
 #endif
 #endif
 
-#ifdef USE_AVX
+#if defined(USE_AVX) || defined(USE_AVX512)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(__GNUC__)
@@ -226,6 +228,80 @@ inline float euclidean_distance<float>(const float* x, const float* y, int f) {
     }
     // Sum all floats in dot register.
     result = hsum256_ps_avx(d);
+  }
+  // Don't forget the remaining values.
+  for (; f > 0; f--) {
+    float tmp = *x - *y;
+    result += tmp * tmp;
+    x++;
+    y++;
+  }
+  return result;
+}
+
+#endif
+
+#ifdef USE_AVX512
+template<>
+inline float dot<float>(const float* x, const float *y, int f) {
+  float result = 0;
+  if (f > 15) {
+    __m512 d = _mm512_setzero_ps();
+    for (; f > 15; f -= 16) {
+      //AVX512F includes FMA
+      d = _mm512_fmadd_ps(_mm512_loadu_ps(x), _mm512_loadu_ps(y), d);
+      x += 16;
+      y += 16;
+    }
+    // Sum all floats in dot register.
+    result += _mm512_reduce_add_ps(d);
+  }
+  // Don't forget the remaining values.
+  for (; f > 0; f--) {
+    result += *x * *y;
+    x++;
+    y++;
+  }
+  return result;
+}
+
+template<>
+inline float manhattan_distance<float>(const float* x, const float* y, int f) {
+  float result = 0;
+  int i = f;
+  if (f > 15) {
+    __m512 manhattan = _mm512_setzero_ps();
+    for (; i > 15; i -= 16) {
+      const __m512 x_minus_y = _mm512_sub_ps(_mm512_loadu_ps(x), _mm512_loadu_ps(y));
+      manhattan = _mm512_add_ps(manhattan, _mm512_abs_ps(x_minus_y));
+      x += 16;
+      y += 16;
+    }
+    // Sum all floats in manhattan register.
+    result = _mm512_reduce_add_ps(manhattan);
+  }
+  // Don't forget the remaining values.
+  for (; i > 0; i--) {
+    result += fabsf(*x - *y);
+    x++;
+    y++;
+  }
+  return result;
+}
+
+template<>
+inline float euclidean_distance<float>(const float* x, const float* y, int f) {
+  float result=0;
+  if (f > 15) {
+    __m512 d = _mm512_setzero_ps();
+    for (; f > 15; f -= 16) {
+      const __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(x), _mm512_loadu_ps(y));
+      d = _mm512_fmadd_ps(diff, diff, d);
+      x += 16;
+      y += 16;
+    }
+    // Sum all floats in dot register.
+    result = _mm512_reduce_add_ps(d);
   }
   // Don't forget the remaining values.
   for (; f > 0; f--) {
@@ -590,7 +666,7 @@ struct Hamming : Base {
       for (; j < dim; j++) {
         n->v[0] = j;
         cur_size = 0;
-	for (typename vector<Node<S, T>*>::const_iterator it = nodes.begin(); it != nodes.end(); ++it) {
+        for (typename vector<Node<S, T>*>::const_iterator it = nodes.begin(); it != nodes.end(); ++it) {
           if (margin(n, (*it)->v, f)) {
             cur_size++;
           }
@@ -716,12 +792,12 @@ template<typename S, typename T>
 class AnnoyIndexInterface {
  public:
   virtual ~AnnoyIndexInterface() {};
-  virtual void add_item(S item, const T* w) = 0;
-  virtual void build(int q) = 0;
-  virtual void unbuild() = 0;
-  virtual bool save(const char* filename, bool prefault=false) = 0;
+  virtual bool add_item(S item, const T* w, char** error=NULL) = 0;
+  virtual bool build(int q, char** error=NULL) = 0;
+  virtual bool unbuild(char** error=NULL) = 0;
+  virtual bool save(const char* filename, bool prefault=false, char** error=NULL) = 0;
   virtual void unload() = 0;
-  virtual bool load(const char* filename, bool prefault=false) = 0;
+  virtual bool load(const char* filename, bool prefault=false, char** error=NULL) = 0;
   virtual T get_distance(S i, S j) const = 0;
   virtual void get_nns_by_item(S item, size_t n, size_t search_k, vector<S>* result, vector<T>* distances) const = 0;
   virtual void get_nns_by_vector(const T* w, size_t n, size_t search_k, vector<S>* result, vector<T>* distances) const = 0;
@@ -730,7 +806,7 @@ class AnnoyIndexInterface {
   virtual void verbose(bool v) = 0;
   virtual void get_item(S item, T* v) const = 0;
   virtual void set_seed(int q) = 0;
-  virtual bool on_disk_build(const char* filename) = 0;
+  virtual bool on_disk_build(const char* filename, char** error=NULL) = 0;
 };
 
 template<typename S, typename T, typename Distance, typename Random>
@@ -776,12 +852,17 @@ public:
     return _f;
   }
 
-  void add_item(S item, const T* w) {
-    add_item_impl(item, w);
+  bool add_item(S item, const T* w, char** error=NULL) {
+    return add_item_impl(item, w, error);
   }
 
   template<typename W>
-  void add_item_impl(S item, const W& w) {
+  bool add_item_impl(S item, const W& w, char** error=NULL) {
+    if (_loaded) {
+      showUpdate("You can't add an item to a loaded index\n");
+      if (error) *error = (char *)"You can't add an item to a loaded index";
+      return false;
+    }
     _allocate_size(item + 1);
     Node* n = _get(item);
 
@@ -798,17 +879,25 @@ public:
 
     if (item >= _n_items)
       _n_items = item + 1;
+
+    return true;
   }
     
-  bool on_disk_build(const char* file) {
+  bool on_disk_build(const char* file, char** error=NULL) {
     _on_disk = true;
     _fd = open(file, O_RDWR | O_CREAT | O_TRUNC, (int) 0600);
     if (_fd == -1) {
+      showUpdate("Error: file descriptor is -1\n");
+      if (error) *error = strerror(errno);
       _fd = 0;
       return false;
     }
     _nodes_size = 1;
-    ftruncate(_fd, _s * _nodes_size);
+    if (ftruncate(_fd, _s * _nodes_size) == -1) {
+      showUpdate("Error truncating file: %s\n", strerror(errno));
+      if (error) *error = strerror(errno);
+      return false;
+    }
 #ifdef MAP_POPULATE
     _nodes = (Node*) mmap(0, _s * _nodes_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, _fd, 0);
 #else
@@ -817,11 +906,11 @@ public:
     return true;
   }
     
-  void build(int q) {
+  bool build(int q, char** error=NULL) {
     if (_loaded) {
-      // TODO: throw exception
       showUpdate("You can't build a loaded index\n");
-      return;
+      if (error) *error = (char *)"You can't build a loaded index";
+      return false;
     }
 
     D::template preprocess<T, S, Node>(_nodes, _s, _n_items, _f);
@@ -836,7 +925,7 @@ public:
 
       vector<S> indices;
       for (S i = 0; i < _n_items; i++) {
-	      if (_get(i)->n_descendants >= 1) // Issue #223
+        if (_get(i)->n_descendants >= 1) // Issue #223
           indices.push_back(i);
       }
 
@@ -854,22 +943,31 @@ public:
     
     if (_on_disk) {
       _nodes = remap_memory(_nodes, _fd, _s * _nodes_size, _s * _n_nodes);
-      ftruncate(_fd, _s * _n_nodes);
+      if (ftruncate(_fd, _s * _n_nodes)) {
+	// TODO: this probably creates an index in a corrupt state... not sure what to do
+	showUpdate("Error truncating file: %s\n", strerror(errno));
+	if (error) *error = strerror(errno);
+	return false;
+      }
       _nodes_size = _n_nodes;
     }
+    return true;
   }
   
-  void unbuild() {
+  bool unbuild(char** error=NULL) {
     if (_loaded) {
       showUpdate("You can't unbuild a loaded index\n");
-      return;
+      if (error) *error = (char *)"You can't unbuild a loaded index";
+      return false;
     }
 
     _roots.clear();
     _n_nodes = _n_items;
+
+    return true;
   }
 
-  bool save(const char* filename, bool prefault=false) {
+  bool save(const char* filename, bool prefault=false, char** error=NULL) {
     if (_on_disk) {
       return true;
     } else {
@@ -877,14 +975,26 @@ public:
       unlink(filename);
 
       FILE *f = fopen(filename, "wb");
-      if (f == NULL)
+      if (f == NULL) {
+        showUpdate("Unable to open: %s\n", strerror(errno));
+        if (error) *error = strerror(errno);
         return false;
+      }
 
-      fwrite(_nodes, _s, _n_nodes, f);
-      fclose(f);
+      if (fwrite(_nodes, _s, _n_nodes, f) != (size_t) _n_nodes) {
+        showUpdate("Unable to write: %s\n", strerror(errno));
+        if (error) *error = strerror(errno);
+        return false;
+      }
+
+      if (fclose(f) == EOF) {
+        showUpdate("Unable to close: %s\n", strerror(errno));
+        if (error) *error = strerror(errno);
+        return false;
+      }
 
       unload();
-      return load(filename, prefault=false);
+      return load(filename, prefault, error);
     }
   }
 
@@ -917,22 +1027,33 @@ public:
     if (_verbose) showUpdate("unloaded\n");
   }
 
-  bool load(const char* filename, bool prefault=false) {
+  bool load(const char* filename, bool prefault=false, char** error=NULL) {
     _fd = open(filename, O_RDONLY, (int)0400);
     if (_fd == -1) {
+      showUpdate("Error: file descriptor is -1\n");
+      if (error) *error = strerror(errno);
       _fd = 0;
       return false;
     }
     off_t size = lseek(_fd, 0, SEEK_END);
+    if (size <= 0) {
+      showUpdate("Warning: index size %zu\n", (size_t)size);
+    }
+    int flags = MAP_SHARED;
+    if (prefault) {
 #ifdef MAP_POPULATE
-    const int populate = prefault ? MAP_POPULATE : 0;
-    _nodes = (Node*)mmap(
-        0, size, PROT_READ, MAP_SHARED | populate, _fd, 0);
+      flags |= MAP_POPULATE;
 #else
-    _nodes = (Node*)mmap(
-        0, size, PROT_READ, MAP_SHARED, _fd, 0);
+      showUpdate("prefault is set to true, but MAP_POPULATE is not defined on this platform");
 #endif
-
+    }
+    _nodes = (Node*)mmap(0, size, PROT_READ, flags, _fd, 0);
+    if (size % _s) {
+      // Something is fishy with this index!
+      showUpdate("Error: index size %zu is not a multiple of vector size %zu\n", (size_t)size, _s);
+      if (error) *error = (char *)"Index size is not a multiple of vector size";
+      return false;
+    }
     _n_nodes = (S)(size / _s);
 
     // Find the roots by scanning the end of the file and taking the nodes with most descendants
@@ -961,6 +1082,7 @@ public:
   }
 
   void get_nns_by_item(S item, size_t n, size_t search_k, vector<S>* result, vector<T>* distances) const {
+    // TODO: handle OOB
     const Node* m = _get(item);
     _get_all_nns(m->v, n, search_k, result, distances);
   }
@@ -982,6 +1104,7 @@ public:
   }
 
   void get_item(S item, T* v) const {
+    // TODO: handle OOB
     Node* m = _get(item);
     memcpy(v, m->v, (_f) * sizeof(T));
   }
@@ -1136,7 +1259,7 @@ protected:
 
     // Get distances for all items
     // To avoid calculating distance multiple times for any items, sort by id
-    sort(nns.begin(), nns.end());
+    std::sort(nns.begin(), nns.end());
     vector<pair<T, S> > nns_dist;
     S last = -1;
     for (size_t i = 0; i < nns.size(); i++) {
