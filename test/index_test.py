@@ -50,8 +50,11 @@ class IndexTest(TestCase):
     def test_save_twice(self):
         # Issue #100
         t = AnnoyIndex(10, 'angular')
-        t.save("t.ann")
-        t.save("t.ann")
+        for i in range(100):
+            t.add_item(i, [random.gauss(0, 1) for z in range(10)])
+        t.build(10)
+        t.save('t1.ann')
+        t.save('t2.ann')
 
     def test_load_save(self):
         # Issue #61
@@ -78,13 +81,11 @@ class IndexTest(TestCase):
         self.assertEqual(u, y)
 
     def test_save_without_build(self):
-        # Issue #61
-        i = AnnoyIndex(10, 'angular')
-        i.add_item(1000, [random.gauss(0, 1) for z in range(10)])
-        i.save('x.tree')
-        j = AnnoyIndex(10, 'angular')
-        j.load('x.tree')
-        self.assertRaises(Exception, j.build, 10)
+        t = AnnoyIndex(10, 'angular')
+        for i in range(100):
+            t.add_item(i, [random.gauss(0, 1) for z in range(10)])
+        # Note: in earlier version, this was allowed (see eg #61)
+        self.assertRaises(Exception, t.save, 'x.tree')
         
     def test_unbuild_with_loaded_tree(self):
         i = AnnoyIndex(10, 'angular')
@@ -184,25 +185,11 @@ class IndexTest(TestCase):
             t.add_item(i, v)
         t.build(10)
 
-        if sys.platform == "linux" or sys.platform == "linux2":
-            # linux
-            try:
-                t.save("/dev/full") 
-                self.fail("didn't get expected exception")
-            except Exception as e:
-                self.assertTrue('No space left on device' in str(e))
-        elif sys.platform == "darwin":
-            volume = "FULLDISK"
-            device = os.popen('hdiutil attach -nomount ram://64').read()
-            os.popen('diskutil erasevolume MS-DOS %s %s' % (volume, device))
-            os.popen('touch "/Volumes/%s/full"' % volume)
-            try:
-                t.save('/Volumes/%s/annoy.tree' % volume)
-                self.fail("didn't get expected exception")
-            except Exception as e:
-                self.assertTrue('No space left on device' in str(e))
-            finally:
-                os.popen("hdiutil detach %s" % device)
+        if os.name == 'nt':
+            path = 'Z:\\xyz.annoy'
+        else:
+            path = '/x/y/z.annoy'
+        self.assertRaises(Exception, t.save, path)
 
     def test_dimension_mismatch(self):
         t = AnnoyIndex(100, 'angular')
@@ -224,6 +211,15 @@ class IndexTest(TestCase):
         t.build(10)
         t.save('test.annoy')
 
-        # Used to segfault
+        # Used to segfault:
         v = [random.gauss(0, 1) for z in range(100)]
         self.assertRaises(Exception, t.add_item, i, v)
+
+    def test_build_twice(self):
+        # 420
+        t = AnnoyIndex(100, 'angular')
+        for i in range(1000):
+            t.add_item(i, [random.gauss(0, 1) for z in range(100)])
+        t.build(10)
+        # Used to segfault:
+        self.assertRaises(Exception, t.build, 10)

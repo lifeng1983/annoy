@@ -836,11 +836,13 @@ protected:
   bool _verbose;
   int _fd;
   bool _on_disk;
+  bool _built;
 public:
 
-  AnnoyIndex(int f) : _f(f), _random() {
+   AnnoyIndex(int f) : _f(f), _random() {
     _s = offsetof(Node, v) + _f * sizeof(T); // Size of each node
     _verbose = false;
+    _built = false;
     _K = (S) (((size_t) (_s - offsetof(Node, children))) / sizeof(S)); // Max number of descendants to fit into node
     reinitialize(); // Reset everything
   }
@@ -913,6 +915,12 @@ public:
       return false;
     }
 
+    if (_built) {
+      showUpdate("You can't build a built index\n");
+      if (error) *error = (char *)"You can't build a built index";
+      return false;
+    }
+
     D::template preprocess<T, S, Node>(_nodes, _s, _n_items, _f);
 
     _n_nodes = _n_items;
@@ -951,6 +959,7 @@ public:
       }
       _nodes_size = _n_nodes;
     }
+    _built = true;
     return true;
   }
   
@@ -963,11 +972,17 @@ public:
 
     _roots.clear();
     _n_nodes = _n_items;
+    _built = false;
 
     return true;
   }
 
   bool save(const char* filename, bool prefault=false, char** error=NULL) {
+    if (!_built) {
+      showUpdate("You can't save an index that hasn't been built\n");
+      if (error) *error = (char *)"You can't save an index that hasn't been built";
+      return false;
+    }
     if (_on_disk) {
       return true;
     } else {
@@ -1036,9 +1051,21 @@ public:
       return false;
     }
     off_t size = lseek(_fd, 0, SEEK_END);
-    if (size <= 0) {
-      showUpdate("Warning: index size %zu\n", (size_t)size);
+    if (size == -1) {
+      showUpdate("lseek returned -1\n");
+      if (error) *error = strerror(errno);
+      return false;
+    } else if (size == 0) {
+      showUpdate("Size of file is zero\n");
+      if (error) *error = (char *)"Size of file is zero";
+      return false;
+    } else if (size % _s) {
+      // Something is fishy with this index!
+      showUpdate("Error: index size %zu is not a multiple of vector size %zu\n", (size_t)size, _s);
+      if (error) *error = (char *)"Index size is not a multiple of vector size";
+      return false;
     }
+
     int flags = MAP_SHARED;
     if (prefault) {
 #ifdef MAP_POPULATE
@@ -1048,12 +1075,6 @@ public:
 #endif
     }
     _nodes = (Node*)mmap(0, size, PROT_READ, flags, _fd, 0);
-    if (size % _s) {
-      // Something is fishy with this index!
-      showUpdate("Error: index size %zu is not a multiple of vector size %zu\n", (size_t)size, _s);
-      if (error) *error = (char *)"Index size is not a multiple of vector size";
-      return false;
-    }
     _n_nodes = (S)(size / _s);
 
     // Find the roots by scanning the end of the file and taking the nodes with most descendants
@@ -1072,6 +1093,7 @@ public:
     if (_roots.size() > 1 && _get(_roots.front())->children[0] == _get(_roots.back())->children[0])
       _roots.pop_back();
     _loaded = true;
+    _built = true;
     _n_items = m;
     if (_verbose) showUpdate("found %lu roots with degree %d\n", _roots.size(), m);
     return true;
@@ -1121,7 +1143,8 @@ protected:
       void *old = _nodes;
       
       if (_on_disk) {
-        ftruncate(_fd, _s * new_nodes_size);
+        int rc = ftruncate(_fd, _s * new_nodes_size);
+        if (_verbose && rc) showUpdate("File truncation error\n");
         _nodes = remap_memory(_nodes, _fd, _s * _nodes_size, _s * new_nodes_size);
       } else {
         _nodes = realloc(_nodes, _s * new_nodes_size);
